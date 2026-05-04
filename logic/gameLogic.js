@@ -11,11 +11,21 @@ const RPS_RULES = {
 
 /**
  * Determines the winner of a Rock-Paper-Scissors round.
+ * Improved robustness for multiplayer by normalizing moves.
  */
 function getRoundResult(p1Move, p2Move) {
     if (!p1Move || !p2Move) return 'draw';
-    if (p1Move === p2Move) return 'draw';
-    return RPS_RULES[p1Move].beats === p2Move ? 'p1' : 'p2';
+
+    // Normalize to lowercase to prevent "Paper" vs "paper" mismatch glitches
+    const m1 = p1Move.toLowerCase();
+    const m2 = p2Move.toLowerCase();
+
+    if (m1 === m2) return 'draw';
+
+    // Verify move exists in rules to prevent crashes
+    if (!RPS_RULES[m1]) return 'draw';
+
+    return RPS_RULES[m1].beats === m2 ? 'p1' : 'p2';
 }
 
 /**
