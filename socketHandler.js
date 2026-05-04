@@ -98,7 +98,10 @@ async function handleStartGame(ws, { mode, username, userId, roomCode, action })
             status: 'playing'
         };
         activeGames.set(gameId, gameState);
-        ws.send(JSON.stringify({ type: 'GAME_STARTED', payload: gameState }));
+        ws.send(JSON.stringify({ 
+            type: 'GAME_STARTED', 
+            payload: { ...gameState, yourRole: 'p1' } 
+        }));
     } 
     else if (mode === 'friend') {
         if (action === 'create') {
@@ -151,9 +154,18 @@ async function initOnlineGame(p1Data, p2Data, mode) {
         console.error("Match Start DB Error:", err);
     }
 
-    const startMsg = JSON.stringify({ type: 'GAME_STARTED', payload: gameState });
-    if(p1Data.ws) p1Data.ws.send(startMsg);
-    if(p2Data.ws) p2Data.ws.send(startMsg);
+    if (p1Data.ws) {
+        p1Data.ws.send(JSON.stringify({ 
+            type: 'GAME_STARTED', 
+            payload: { ...gameState, yourRole: 'p1' } 
+        }));
+    }
+    if (p2Data.ws) {
+        p2Data.ws.send(JSON.stringify({ 
+            type: 'GAME_STARTED', 
+            payload: { ...gameState, yourRole: 'p2' } 
+        }));
+    }
 }
 
 async function handlePlayerMove(ws, { gameId, move, userId }) {
@@ -171,7 +183,7 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                 p1Move, 
                 p2Move, 
                 result, 
-                yourRole: 'p1', // In local, user is always p1
+                yourRole: 'p1',
                 p1Score: game.p1.score, 
                 p2Score: game.p2.score 
             } 
@@ -184,6 +196,7 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
             setTimeout(() => {
                 const action = getCPUAction(game.p2.stats);
                 processAction(game, 'p2', action);
+                
                 ws.send(JSON.stringify({ 
                     type: 'UPDATE_UI', 
                     payload: { 
@@ -192,17 +205,20 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                         cpuAction: action 
                     } 
                 }));
+
+                // FIX: Check if CPU won after its action
+                if (game.p2.score >= 100) {
+                    handleGameOver(ws, 'p2_win', game);
+                }
             }, 1200);
         }
     } else {
-        // Online Mode Logic
         const player = (game.p1.userId === userId) ? game.p1 : game.p2;
         if (player) player.move = move;
 
         if (game.p1.move && game.p2.move) {
             const result = getRoundResult(game.p1.move, game.p2.move);
             
-            // Send specific payloads to each player telling them their role (p1 or p2)
             const p1Payload = { 
                 type: 'ROUND_RESULT', 
                 payload: { p1Move: game.p1.move, p2Move: game.p2.move, result, yourRole: 'p1' } 
@@ -216,7 +232,6 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
             if(game.p2.ws) game.p2.ws.send(JSON.stringify(p2Payload));
 
             if (result === 'draw') {
-                // Clear moves immediately to prevent "Paper Glitch"
                 game.p1.move = null;
                 game.p2.move = null;
                 setTimeout(() => {
@@ -267,7 +282,6 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
         if(game.p2.ws) game.p2.ws.send(JSON.stringify(updatePayload));
     }
 
-    // CRITICAL: Clear moves after an action phase so the next round of RPS is clean
     game.p1.move = null;
     game.p2.move = null;
 
