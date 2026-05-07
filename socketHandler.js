@@ -31,6 +31,9 @@ function handleSocketConnection(ws) {
                 case 'START_GAME':
                     handleStartGame(ws, payload);
                     break;
+                case 'LEAVE_QUEUE':
+                    handleLeaveQueue(ws, payload);
+                    break;
                 case 'SUBMIT_MOVE':
                     handlePlayerMove(ws, payload);
                     break;
@@ -40,6 +43,9 @@ function handleSocketConnection(ws) {
                 case 'GIVE_UP':
                     handleGameOver(ws, 'forfeit', activeGames.get(payload.gameId));
                     break;
+                case 'VERIFY_SESSION':
+                    handleVerifySession(ws, payload);
+                    break;
             }
         } catch (err) {
             console.error('Error processing message:', err);
@@ -47,9 +53,11 @@ function handleSocketConnection(ws) {
     });
 
     ws.on('close', () => {
+        // Remove from matchmaking queue
         const idx = waitingPlayers.findIndex(p => p.ws === ws);
         if (idx !== -1) waitingPlayers.splice(idx, 1);
         
+        // Cleanup Friend Rooms
         for (const [code, host] of friendRooms.entries()) {
             if (host.ws === ws) {
                 friendRooms.delete(code);
@@ -58,6 +66,36 @@ function handleSocketConnection(ws) {
         }
         console.log('Client disconnected');
     });
+}
+
+/**
+ * Handle user leaving the matchmaking queue
+ */
+function handleLeaveQueue(ws, { userId }) {
+    const idx = waitingPlayers.findIndex(p => p.userId === userId || p.ws === ws);
+    if (idx !== -1) {
+        waitingPlayers.splice(idx, 1);
+        console.log(`User ${userId} left the queue.`);
+    }
+}
+
+/**
+ * Re-validates a game session if the user refreshes
+ */
+function handleVerifySession(ws, { gameId }) {
+    const game = activeGames.get(gameId);
+    if (game) {
+        // Update the socket reference for the reconnected player
+        if (game.p1.ws === null || game.p1.ws.readyState !== 1) game.p1.ws = ws;
+        else if (game.p2.mode !== 'local' && (game.p2.ws === null || game.p2.ws.readyState !== 1)) game.p2.ws = ws;
+
+        ws.send(JSON.stringify({ 
+            type: 'SESSION_VALID', 
+            payload: { gameId, yourRole: (game.p1.ws === ws ? 'p1' : 'p2') } 
+        }));
+    } else {
+        ws.send(JSON.stringify({ type: 'SESSION_INVALID' }));
+    }
 }
 
 async function handleAuth(ws, payload, type) {
@@ -83,7 +121,7 @@ async function handleAuth(ws, payload, type) {
     }
 
     if (result && !result.success) {
-        ws.send(JSON.stringify({ type: 'AUTH_ERROR', payload: { message: result.error } }));
+        ws.send(JSON.stringify({ type: 'ERROR', payload: { message: result.error } }));
     }
 }
 
@@ -107,7 +145,6 @@ async function handleStartGame(ws, { mode, username, userId, roomCode, action })
         if (action === 'create') {
             const code = Math.floor(1000 + Math.random() * 9000).toString();
             friendRooms.set(code, { ws, userId, username });
-            
             ws.send(JSON.stringify({ 
                 type: 'ROOM_CREATED', 
                 payload: { roomCode: code } 
@@ -118,11 +155,17 @@ async function handleStartGame(ws, { mode, username, userId, roomCode, action })
                 friendRooms.delete(roomCode);
                 initOnlineGame(host, { ws, userId, username }, 'friend');
             } else {
-                ws.send(JSON.stringify({ type: 'AUTH_ERROR', payload: { message: "Room not found or invalid code!" } }));
+                ws.send(JSON.stringify({ type: 'ERROR', payload: { message: "Room not found or invalid code!" } }));
             }
         }
     }
     else if (mode === 'online') {
+        const alreadyWaiting = waitingPlayers.find(p => p.userId === userId);
+        if (alreadyWaiting) {
+            ws.send(JSON.stringify({ type: 'WAITING_FOR_OPPONENT' }));
+            return;
+        }
+
         if (waitingPlayers.length > 0 && waitingPlayers[0].userId !== userId) {
             const opponent = waitingPlayers.shift();
             initOnlineGame(opponent, { ws, userId, username }, 'online');
@@ -154,18 +197,11 @@ async function initOnlineGame(p1Data, p2Data, mode) {
         console.error("Match Start DB Error:", err);
     }
 
-    if (p1Data.ws) {
-        p1Data.ws.send(JSON.stringify({ 
-            type: 'GAME_STARTED', 
-            payload: { ...gameState, yourRole: 'p1' } 
-        }));
-    }
-    if (p2Data.ws) {
-        p2Data.ws.send(JSON.stringify({ 
-            type: 'GAME_STARTED', 
-            payload: { ...gameState, yourRole: 'p2' } 
-        }));
-    }
+    const startP1 = JSON.stringify({ type: 'GAME_STARTED', payload: { ...gameState, yourRole: 'p1' } });
+    const startP2 = JSON.stringify({ type: 'GAME_STARTED', payload: { ...gameState, yourRole: 'p2' } });
+
+    if (p1Data.ws) p1Data.ws.send(startP1);
+    if (p2Data.ws) p2Data.ws.send(startP2);
 }
 
 async function handlePlayerMove(ws, { gameId, move, userId }) {
@@ -179,37 +215,20 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
 
         ws.send(JSON.stringify({ 
             type: 'ROUND_RESULT', 
-            payload: { 
-                p1Move, 
-                p2Move, 
-                result, 
-                yourRole: 'p1',
-                p1Score: game.p1.score, 
-                p2Score: game.p2.score 
-            } 
+            payload: { p1Move, p2Move, result, yourRole: 'p1', p1Score: game.p1.score, p2Score: game.p2.score } 
         }));
 
         if (result === 'draw') {
             setTimeout(() => ws.send(JSON.stringify({ type: 'RESET_ROUND' })), 1500);
         } else if (result === 'p2') {
-            // CPU wins RPS - trigger CPU action automatically
             setTimeout(() => {
                 const action = getCPUAction(game.p2.stats);
                 processAction(game, 'p2', action);
-                
                 ws.send(JSON.stringify({ 
                     type: 'UPDATE_UI', 
-                    payload: { 
-                        p1Score: game.p1.score, p1Stats: game.p1.stats, 
-                        p2Score: game.p2.score, p2Stats: game.p2.stats, 
-                        cpuAction: action 
-                    } 
+                    payload: { p1Score: game.p1.score, p1Stats: game.p1.stats, p2Score: game.p2.score, p2Stats: game.p2.stats, cpuAction: action } 
                 }));
-
-                // FIX: Check if CPU won after its action
-                if (game.p2.score >= 100) {
-                    handleGameOver(ws, 'p2_win', game);
-                }
+                if (game.p2.score >= 100) handleGameOver(ws, 'p2_win', game);
             }, 1200);
         }
     } else {
@@ -218,22 +237,14 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
 
         if (game.p1.move && game.p2.move) {
             const result = getRoundResult(game.p1.move, game.p2.move);
+            const res1 = JSON.stringify({ type: 'ROUND_RESULT', payload: { p1Move: game.p1.move, p2Move: game.p2.move, result, yourRole: 'p1' } });
+            const res2 = JSON.stringify({ type: 'ROUND_RESULT', payload: { p1Move: game.p1.move, p2Move: game.p2.move, result, yourRole: 'p2' } });
             
-            const p1Payload = { 
-                type: 'ROUND_RESULT', 
-                payload: { p1Move: game.p1.move, p2Move: game.p2.move, result, yourRole: 'p1' } 
-            };
-            const p2Payload = { 
-                type: 'ROUND_RESULT', 
-                payload: { p1Move: game.p1.move, p2Move: game.p2.move, result, yourRole: 'p2' } 
-            };
-            
-            if(game.p1.ws) game.p1.ws.send(JSON.stringify(p1Payload));
-            if(game.p2.ws) game.p2.ws.send(JSON.stringify(p2Payload));
+            if(game.p1.ws) game.p1.ws.send(res1);
+            if(game.p2.ws) game.p2.ws.send(res2);
 
             if (result === 'draw') {
-                game.p1.move = null;
-                game.p2.move = null;
+                game.p1.move = null; game.p2.move = null;
                 setTimeout(() => {
                     const reset = JSON.stringify({ type: 'RESET_ROUND' });
                     if(game.p1.ws) game.p1.ws.send(reset); 
@@ -253,41 +264,19 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
 
     processAction(game, winnerKey, action);
 
-    if (game.mode !== 'local') {
-        try {
-            await pool.query(
-                `INSERT INTO match_actions (match_id, actor_id, target_id, action_type, points_earned, anger_val, confidence_val, satisfaction_val) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [game.id, game[winnerKey].userId, game[loserKey].userId, action, 0, game[winnerKey].stats.anger, game[winnerKey].stats.confidence, game[winnerKey].stats.satisfaction]
-            );
-        } catch (dbErr) {
-            console.error("Match Action DB Error:", dbErr);
-        }
-    }
-
-    const updatePayload = { 
+    const updatePayload = JSON.stringify({ 
         type: 'UPDATE_UI', 
-        payload: { 
-            p1Score: game.p1.score, p1Stats: game.p1.stats,
-            p2Score: game.p2.score, p2Stats: game.p2.stats,
-            actorRole: winnerKey,
-            onlineAction: action  
-        } 
-    };
+        payload: { p1Score: game.p1.score, p1Stats: game.p1.stats, p2Score: game.p2.score, p2Stats: game.p2.stats, actorRole: winnerKey, onlineAction: action } 
+    });
 
-    if (game.mode === 'local') {
-        ws.send(JSON.stringify(updatePayload));
-    } else {
-        if(game.p1.ws) game.p1.ws.send(JSON.stringify(updatePayload));
-        if(game.p2.ws) game.p2.ws.send(JSON.stringify(updatePayload));
+    if (game.mode === 'local') ws.send(updatePayload);
+    else {
+        if(game.p1.ws) game.p1.ws.send(updatePayload);
+        if(game.p2.ws) game.p2.ws.send(updatePayload);
     }
 
-    game.p1.move = null;
-    game.p2.move = null;
-
-    if (game[winnerKey].score >= 100) {
-        handleGameOver(ws, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game);
-    }
+    game.p1.move = null; game.p2.move = null;
+    if (game[winnerKey].score >= 100) handleGameOver(ws, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game);
 }
 
 function processAction(game, winnerKey, action) {
@@ -298,15 +287,15 @@ function processAction(game, winnerKey, action) {
     const points = calculateStateChange(action, winner.stats) || 0;
     winner.score += points;
 
-    const winDeltas = getStatDeltas('winner', action) || {};
-    winner.stats.anger = clamp(winner.stats.anger + (winDeltas.anger || 0));
-    winner.stats.satisfaction = clamp(winner.stats.satisfaction + (winDeltas.satisfaction || 0));
-    winner.stats.confidence = clamp(winner.stats.confidence + (winDeltas.confidence || 0));
+    const winDeltas = getStatDeltas('winner', action);
+    winner.stats.anger = clamp(winner.stats.anger + winDeltas.anger);
+    winner.stats.satisfaction = clamp(winner.stats.satisfaction + winDeltas.satisfaction);
+    winner.stats.confidence = clamp(winner.stats.confidence + winDeltas.confidence);
 
-    const loseDeltas = getStatDeltas('loser', action) || {};
-    loser.stats.anger = clamp(loser.stats.anger + (loseDeltas.anger || 0));
-    loser.stats.satisfaction = clamp(loser.stats.satisfaction + (loseDeltas.satisfaction || 0));
-    loser.stats.confidence = clamp(loser.stats.confidence + (loseDeltas.confidence || 0));
+    const loseDeltas = getStatDeltas('loser', action);
+    loser.stats.anger = clamp(loser.stats.anger + loseDeltas.anger);
+    loser.stats.satisfaction = clamp(loser.stats.satisfaction + loseDeltas.satisfaction);
+    loser.stats.confidence = clamp(loser.stats.confidence + loseDeltas.confidence);
 }
 
 async function handleGameOver(ws, reason, game) {
@@ -316,9 +305,7 @@ async function handleGameOver(ws, reason, game) {
             try {
                 await pool.query('UPDATE matches SET winner_id = ?, p1_score = ?, p2_score = ? WHERE match_id = ?', 
                     [winnerId, game.p1.score, game.p2.score, game.id]);
-            } catch (err) {
-                console.error("Match End DB Error:", err);
-            }
+            } catch (err) { console.error("Match End DB Error:", err); }
         }
         
         const overMsg = JSON.stringify({ type: 'GAME_OVER', payload: { reason } });
@@ -327,7 +314,6 @@ async function handleGameOver(ws, reason, game) {
             if(game.p1.ws) game.p1.ws.send(overMsg); 
             if(game.p2.ws) game.p2.ws.send(overMsg); 
         }
-        
         activeGames.delete(game.id);
     }
 }
