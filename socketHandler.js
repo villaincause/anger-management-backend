@@ -13,6 +13,24 @@ const friendRooms = new Map();
 
 const clamp = (val) => Math.max(0, Math.min(100, Math.round(val || 0)));
 
+/**
+ * Helper to sync fresh DB stats (wins/losses) to the client
+ */
+async function syncPlayerStats(ws, userId) {
+    if (!userId || userId === 1 || !ws || ws.readyState !== 1) return;
+    try {
+        const [rows] = await pool.query('SELECT wins, losses FROM players WHERE player_id = ?', [userId]);
+        if (rows.length > 0) {
+            ws.send(JSON.stringify({ 
+                type: 'UPDATE_STATS', 
+                payload: { wins: rows[0].wins, losses: rows[0].losses } 
+            }));
+        }
+    } catch (err) {
+        console.error("Stats Sync Error:", err);
+    }
+}
+
 function handleSocketConnection(ws) {
     console.log('New client connected');
 
@@ -41,6 +59,7 @@ function handleSocketConnection(ws) {
                     handlePlayerAction(ws, payload);
                     break;
                 case 'GIVE_UP':
+                    // Pass current ws to identify who clicked "Give Up"
                     handleGameOver(ws, 'forfeit', activeGames.get(payload.gameId));
                     break;
                 case 'VERIFY_SESSION':
@@ -53,24 +72,18 @@ function handleSocketConnection(ws) {
     });
 
     ws.on('close', () => {
-        // Remove from matchmaking queue
         const idx = waitingPlayers.findIndex(p => p.ws === ws);
         if (idx !== -1) waitingPlayers.splice(idx, 1);
         
-        // Cleanup Friend Rooms
         for (const [code, host] of friendRooms.entries()) {
             if (host.ws === ws) {
                 friendRooms.delete(code);
                 break;
             }
         }
-        console.log('Client disconnected');
     });
 }
 
-/**
- * Handle user leaving the matchmaking queue
- */
 function handleLeaveQueue(ws, { userId }) {
     const idx = waitingPlayers.findIndex(p => p.userId === userId || p.ws === ws);
     if (idx !== -1) {
@@ -79,13 +92,9 @@ function handleLeaveQueue(ws, { userId }) {
     }
 }
 
-/**
- * Re-validates a game session if the user refreshes
- */
 function handleVerifySession(ws, { gameId }) {
     const game = activeGames.get(gameId);
     if (game) {
-        // Update the socket reference for the reconnected player
         if (game.p1.ws === null || game.p1.ws.readyState !== 1) game.p1.ws = ws;
         else if (game.p2.mode !== 'local' && (game.p2.ws === null || game.p2.ws.readyState !== 1)) game.p2.ws = ws;
 
@@ -218,8 +227,9 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
             payload: { p1Move, p2Move, result, yourRole: 'p1', p1Score: game.p1.score, p2Score: game.p2.score } 
         }));
 
+        // Increased timeout to ensure move text finishes before reset or action
         if (result === 'draw') {
-            setTimeout(() => ws.send(JSON.stringify({ type: 'RESET_ROUND' })), 1500);
+            setTimeout(() => ws.send(JSON.stringify({ type: 'RESET_ROUND' })), 2000);
         } else if (result === 'p2') {
             setTimeout(() => {
                 const action = getCPUAction(game.p2.stats);
@@ -228,8 +238,8 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                     type: 'UPDATE_UI', 
                     payload: { p1Score: game.p1.score, p1Stats: game.p1.stats, p2Score: game.p2.score, p2Stats: game.p2.stats, cpuAction: action } 
                 }));
-                if (game.p2.score >= 100) handleGameOver(ws, 'p2_win', game);
-            }, 1200);
+                if (game.p2.score >= 100) handleGameOver(null, 'p2_win', game);
+            }, 2000);
         }
     } else {
         const player = (game.p1.userId === userId) ? game.p1 : game.p2;
@@ -249,7 +259,7 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                     const reset = JSON.stringify({ type: 'RESET_ROUND' });
                     if(game.p1.ws) game.p1.ws.send(reset); 
                     if(game.p2.ws) game.p2.ws.send(reset);
-                }, 1500);
+                }, 2000);
             }
         }
     }
@@ -260,8 +270,6 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
     if (!game || !action) return;
 
     const winnerKey = (game.mode === 'local') ? 'p1' : (game.p1.userId === userId ? 'p1' : 'p2');
-    const loserKey = winnerKey === 'p1' ? 'p2' : 'p1';
-
     processAction(game, winnerKey, action);
 
     const updatePayload = JSON.stringify({ 
@@ -276,7 +284,10 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
     }
 
     game.p1.move = null; game.p2.move = null;
-    if (game[winnerKey].score >= 100) handleGameOver(ws, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game);
+    if (game[winnerKey].score >= 100) {
+        // Delay game over so player can see the final action message
+        setTimeout(() => handleGameOver(null, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game), 1500);
+    }
 }
 
 function processAction(game, winnerKey, action) {
@@ -299,23 +310,65 @@ function processAction(game, winnerKey, action) {
 }
 
 async function handleGameOver(ws, reason, game) {
-    if (game) {
-        if (game.mode !== 'local') {
-            const winnerId = reason === 'p1_win' ? game.p1.userId : (reason === 'p2_win' ? game.p2.userId : null);
-            try {
-                await pool.query('UPDATE matches SET winner_id = ?, p1_score = ?, p2_score = ? WHERE match_id = ?', 
-                    [winnerId, game.p1.score, game.p2.score, game.id]);
-            } catch (err) { console.error("Match End DB Error:", err); }
+    if (!game) return;
+
+    let winnerId = null;
+    let loserId = null;
+    let finalReason = reason;
+
+    // FORFEIT LOGIC FIX:
+    if (reason === 'forfeit') {
+        // If the socket that clicked "Give Up" is P1, P2 wins.
+        const p1Forfeited = (ws === game.p1.ws);
+        if (p1Forfeited) {
+            winnerId = (game.mode !== 'local' ? game.p2.userId : null); // CPU has no ID
+            loserId = game.p1.userId;
+            finalReason = 'p1_forfeit'; // UI will show P1 gave up, P2 wins
+        } else {
+            // This handles Friend/Online where P2 clicked Give Up
+            winnerId = game.p1.userId;
+            loserId = (game.mode !== 'local' ? game.p2.userId : null);
+            finalReason = 'p2_forfeit'; // UI will show P2 gave up, P1 wins
         }
-        
-        const overMsg = JSON.stringify({ type: 'GAME_OVER', payload: { reason } });
-        if (game.mode === 'local') ws.send(overMsg);
-        else { 
-            if(game.p1.ws) game.p1.ws.send(overMsg); 
-            if(game.p2.ws) game.p2.ws.send(overMsg); 
-        }
-        activeGames.delete(game.id);
+    } else if (reason === 'p1_win') {
+        winnerId = game.p1.userId;
+        loserId = (game.mode !== 'local') ? game.p2.userId : null;
+    } else if (reason === 'p2_win') {
+        winnerId = (game.mode !== 'local') ? game.p2.userId : null;
+        loserId = game.p1.userId;
     }
+
+    try {
+        if (game.mode !== 'local') {
+            await pool.query(
+                'UPDATE matches SET winner_id = ?, p1_score = ?, p2_score = ? WHERE match_id = ?', 
+                [winnerId, game.p1.score, game.p2.score, game.id]
+            );
+        }
+
+        // Only update stats for registered players (ID != 1 and not CPU)
+        if (winnerId && winnerId !== 1) {
+            await pool.query('UPDATE players SET wins = wins + 1 WHERE player_id = ?', [winnerId]);
+        }
+        if (loserId && loserId !== 1) {
+            await pool.query('UPDATE players SET losses = losses + 1 WHERE player_id = ?', [loserId]);
+        }
+
+        // Sync new records back to UI
+        if (game.p1.ws) await syncPlayerStats(game.p1.ws, game.p1.userId);
+        if (game.mode !== 'local' && game.p2.ws) {
+            await syncPlayerStats(game.p2.ws, game.p2.userId);
+        }
+
+    } catch (err) {
+        console.error("Game Over DB Update Error:", err);
+    }
+    
+    const overMsg = JSON.stringify({ type: 'GAME_OVER', payload: { reason: finalReason } });
+    if (game.p1.ws && game.p1.ws.readyState === 1) game.p1.ws.send(overMsg); 
+    if (game.mode !== 'local' && game.p2.ws && game.p2.ws.readyState === 1) game.p2.ws.send(overMsg); 
+
+    activeGames.delete(game.id);
 }
 
 module.exports = { handleSocketConnection };
