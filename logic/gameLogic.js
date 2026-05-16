@@ -1,6 +1,6 @@
 /**
  * gameLogic.js - The Secure Game Engine
- * Ports the "Psychorithm" and RPS rules from Java.
+ * Implements the Psychorithm and RPS rules.
  */
 
 const RPS_RULES = {
@@ -11,91 +11,98 @@ const RPS_RULES = {
 
 /**
  * Determines the winner of a Rock-Paper-Scissors round.
- * Improved robustness for multiplayer by normalizing moves.
  */
 function getRoundResult(p1Move, p2Move) {
     if (!p1Move || !p2Move) return 'draw';
 
-    // Normalize to lowercase to prevent "Paper" vs "paper" mismatch glitches
     const m1 = p1Move.toLowerCase();
     const m2 = p2Move.toLowerCase();
 
     if (m1 === m2) return 'draw';
-
-    // Verify move exists in rules to prevent crashes
     if (!RPS_RULES[m1]) return 'draw';
 
     return RPS_RULES[m1].beats === m2 ? 'p1' : 'p2';
 }
 
 /**
- * The "Psychorithm" - Refined Algorithm
+ * The "Psychorithm" - Ported and Scaled for 100pt games
  * Calculates points based on the emotional state of the winner.
  */
 function calculateStateChange(action, stats) {
-    // 1. Ensure stats are valid numbers and clamped
-    const anger = Math.max(0, Math.min(100, stats.anger ?? 50));
-    const satisfaction = Math.max(0, Math.min(100, stats.satisfaction ?? 25));
-    const confidence = Math.max(0, Math.min(100, stats.confidence ?? 0));
-
-    // 2. Modifiers: These represent how emotions scale the physical action
-    // Anger is the primary driver of points (venting)
-    const angerMod = Math.floor(anger / 10); // 0-10 scale
-    const satisfactionMod = Math.floor(satisfaction / 20); // 0-5 scale
-    const confidenceMod = Math.floor(confidence / 25); // 0-4 scale
+    const angerScore = Math.max(0, Math.min(100, stats.anger ?? 50));
+    const satisfactionScore = Math.max(0, Math.min(100, stats.satisfaction ?? 25));
+    const confidenceScore = Math.max(0, Math.min(100, stats.confidence ?? 0));
 
     let basePoints = 0;
-    let finalPoints = 0;
+    let additionalScore = 0;
+    const actionKey = action.toLowerCase();
 
-    switch (action) {
-        case 'slap':
-            basePoints = 5;
-            // Slaps are consistent and low effort
-            finalPoints = basePoints + angerMod;
-            break;
-        case 'punch':
-            basePoints = 10;
-            // Punching is harder; high satisfaction reduces the "release" value
-            finalPoints = basePoints + angerMod - satisfactionMod;
-            break;
-        case 'kick':
-            basePoints = 15;
-            // Kicking is high risk; high confidence/satisfaction reduces the point gain
-            finalPoints = basePoints + angerMod - satisfactionMod - confidenceMod;
-            break;
-        default:
-            finalPoints = 0;
+    // Percentage-based modifiers from original algorithm
+    if (actionKey === 'slap' || actionKey === 'punch') {
+        additionalScore = Math.ceil(angerScore * 0.05) - 
+                          Math.ceil(satisfactionScore * 0.025) - 
+                          Math.ceil(confidenceScore * 0.01);
+    } else if (actionKey === 'kick') {
+        additionalScore = Math.ceil(angerScore * 0.035) - 
+                          Math.ceil(satisfactionScore * 0.025) - 
+                          Math.ceil(confidenceScore * 0.01);
     }
 
-    // Return at least 1 point to ensure the scoreboard ALWAYS updates on a win
-    return Math.max(1, Math.round(finalPoints));
+    // Scaled base points for 100-point win target
+    switch (actionKey) {
+        case 'slap':
+            basePoints = 5 + additionalScore;
+            break;
+        case 'punch':
+            basePoints = 10 + additionalScore;
+            break;
+        case 'kick':
+            basePoints = 15 + additionalScore;
+            break;
+        default:
+            basePoints = 1;
+    }
+
+    return Math.max(1, Math.round(basePoints));
 }
 
 /**
- * Determines stat changes after an action.
- * Winner vents (Anger down), Loser gets frustrated (Anger up).
+ * Determines emotional stat changes based on the Java logic.
  */
 function getStatDeltas(role, action) {
-    // Base deltas adjusted for the specific action type
-    const intensity = { slap: 1, punch: 2, kick: 3 }[action] || 1;
+    const actionKey = action.toLowerCase();
 
     if (role === 'winner') {
-        return {
-            anger: -(5 * intensity),        // More intense actions vent more anger
-            satisfaction: 5 * intensity,    // More intense actions give more satisfaction
-            confidence: 3 * intensity       // Success builds confidence
-        };
+        switch (actionKey) {
+            case 'slap':
+                return { satisfaction: 15, anger: -10, confidence: 5 };
+            case 'punch':
+                return { confidence: 10, anger: -10, satisfaction: 5 };
+            case 'kick':
+                return { confidence: 5, anger: -15, satisfaction: 5 };
+            default:
+                return { anger: -5, satisfaction: 5, confidence: 5 };
+        }
     } else {
-        return {
-            anger: 4 * intensity,           // Getting hit increases anger
-            satisfaction: -(2 * intensity), // Decreases satisfaction
-            confidence: -(1 * intensity)    // Decreases confidence
-        };
+        // Loser Deltas
+        switch (actionKey) {
+            case 'slap':
+                return { confidence: -15, anger: 10, satisfaction: -5 };
+            case 'punch':
+                return { anger: 15, satisfaction: -10, confidence: -5 };
+            case 'kick':
+                return { anger: 25, satisfaction: -10, confidence: -10 };
+            default:
+                return { anger: 10, satisfaction: -5, confidence: -5 };
+        }
     }
 }
 
-module.exports = { 
-    getRoundResult, 
-    calculateStateChange, 
-    getStatDeltas 
-};
+// Export for server use
+if (typeof module !== 'undefined') {
+    module.exports = { 
+        getRoundResult, 
+        calculateStateChange, 
+        getStatDeltas 
+    };
+}

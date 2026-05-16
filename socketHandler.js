@@ -59,7 +59,6 @@ function handleSocketConnection(ws) {
                     handlePlayerAction(ws, payload);
                     break;
                 case 'GIVE_UP':
-                    // Pass current ws to identify who clicked "Give Up"
                     handleGameOver(ws, 'forfeit', activeGames.get(payload.gameId));
                     break;
                 case 'VERIFY_SESSION':
@@ -227,10 +226,10 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
             payload: { p1Move, p2Move, result, yourRole: 'p1', p1Score: game.p1.score, p2Score: game.p2.score } 
         }));
 
-        // Increased timeout to ensure move text finishes before reset or action
         if (result === 'draw') {
             setTimeout(() => ws.send(JSON.stringify({ type: 'RESET_ROUND' })), 2000);
         } else if (result === 'p2') {
+            // CPU won the clash, so CPU performs its action after the animation
             setTimeout(() => {
                 const action = getCPUAction(game.p2.stats);
                 processAction(game, 'p2', action);
@@ -241,6 +240,8 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                 if (game.p2.score >= 100) handleGameOver(null, 'p2_win', game);
             }, 2000);
         }
+        // FIXED: If result === 'p1', we send nothing. 
+        // We wait for the frontend to show the action buttons and send 'SUBMIT_ACTION'.
     } else {
         const player = (game.p1.userId === userId) ? game.p1 : game.p2;
         if (player) player.move = move;
@@ -285,7 +286,6 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
 
     game.p1.move = null; game.p2.move = null;
     if (game[winnerKey].score >= 100) {
-        // Delay game over so player can see the final action message
         setTimeout(() => handleGameOver(null, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game), 1500);
     }
 }
@@ -316,19 +316,16 @@ async function handleGameOver(ws, reason, game) {
     let loserId = null;
     let finalReason = reason;
 
-    // FORFEIT LOGIC FIX:
     if (reason === 'forfeit') {
-        // If the socket that clicked "Give Up" is P1, P2 wins.
         const p1Forfeited = (ws === game.p1.ws);
         if (p1Forfeited) {
-            winnerId = (game.mode !== 'local' ? game.p2.userId : null); // CPU has no ID
+            winnerId = (game.mode !== 'local' ? game.p2.userId : null);
             loserId = game.p1.userId;
-            finalReason = 'p1_forfeit'; // UI will show P1 gave up, P2 wins
+            finalReason = 'p1_forfeit';
         } else {
-            // This handles Friend/Online where P2 clicked Give Up
             winnerId = game.p1.userId;
             loserId = (game.mode !== 'local' ? game.p2.userId : null);
-            finalReason = 'p2_forfeit'; // UI will show P2 gave up, P1 wins
+            finalReason = 'p2_forfeit';
         }
     } else if (reason === 'p1_win') {
         winnerId = game.p1.userId;
@@ -346,7 +343,6 @@ async function handleGameOver(ws, reason, game) {
             );
         }
 
-        // Only update stats for registered players (ID != 1 and not CPU)
         if (winnerId && winnerId !== 1) {
             await pool.query('UPDATE players SET wins = wins + 1 WHERE player_id = ?', [winnerId]);
         }
@@ -354,7 +350,6 @@ async function handleGameOver(ws, reason, game) {
             await pool.query('UPDATE players SET losses = losses + 1 WHERE player_id = ?', [loserId]);
         }
 
-        // Sync new records back to UI
         if (game.p1.ws) await syncPlayerStats(game.p1.ws, game.p1.userId);
         if (game.mode !== 'local' && game.p2.ws) {
             await syncPlayerStats(game.p2.ws, game.p2.userId);
