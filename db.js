@@ -1,54 +1,37 @@
-
-const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-/**
- * TiDB Connection Pool
- * Using a pool is essential for multiplayer games to handle 
- * multiple concurrent requests without crashing the server.
- */
-const pool = mysql.createPool({
-    host: process.env.TIDB_HOST,
-    port: process.env.TIDB_PORT || 4000,
-    user: process.env.TIDB_USER,
-    password: process.env.TIDB_PASSWORD,
-    database: process.env.TIDB_DATABASE,
-    ssl: {
-        minVersion: 'TLSv1.2',
-        rejectUnauthorized: true // TiDB Cloud requires secure SSL connections
-    },
-    waitForConnections: true,
-    connectionLimit: 10, // Adjust based on your traffic needs
-    queueLimit: 0,
-    enableKeepAlive: true,
-    keepAliveInitialDelay: 10000
-});
+const dialect = (process.env.DB_DIALECT || 'tidb').toLowerCase();
+let dbEngine;
+
+// Dynamically source the connection logic from the config folder
+if (dialect === 'oracle') {
+    dbEngine = require('./config/oracle');
+} else {
+    dbEngine = require('./config/mysql');
+}
 
 /**
  * Immediate Connection Test
- * This self-invoking function checks the database status on server startup.
+ * Runs immediately on server startup to visually display connection statuses.
  */
 (async () => {
     try {
-        const connection = await pool.getConnection();
-        console.log('✅ [DATABASE] Connected to TiDB Cloud successfully.');
-        
-        // Check if our tables exist
-        const [tables] = await connection.query('SHOW TABLES');
-        console.log(`📊 [DATABASE] Found ${tables.length} tables in schema.`);
-        
-        connection.release();
+        await dbEngine.testConnection();
     } catch (err) {
-        console.error('❌ [DATABASE] Connection failed!');
+        console.error('❌ [DATABASE] Startup Connection failed!');
         console.error('Error Details:', err.message);
         
-        // Helpful tip for common TiDB errors
-        if (err.message.includes('getaddrinfo')) {
-            console.error('Tip: Check if your TIDB_HOST in .env is correct.');
-        } else if (err.message.includes('Access denied')) {
-            console.error('Tip: Double-check your TIDB_USER and TIDB_PASSWORD.');
+        if (dialect === 'oracle') {
+            console.error('Tip: Make sure your local Oracle database service (XEPDB1) is currently running.');
+        } else {
+            if (err.message.includes('getaddrinfo')) {
+                console.error('Tip: Check if your TIDB_HOST in .env is correct.');
+            } else if (err.message.includes('Access denied')) {
+                console.error('Tip: Double-check your TIDB_USER and TIDB_PASSWORD.');
+            }
         }
     }
 })();
 
-module.exports = pool;
+// Export unified engine interface (.query) to protect original server logic
+module.exports = dbEngine;
