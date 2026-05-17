@@ -237,7 +237,13 @@ async function handlePlayerMove(ws, { gameId, move, userId }) {
                     type: 'UPDATE_UI', 
                     payload: { p1Score: game.p1.score, p1Stats: game.p1.stats, p2Score: game.p2.score, p2Stats: game.p2.stats, cpuAction: action } 
                 }));
-                if (game.p2.score >= 100) handleGameOver(null, 'p2_win', game);
+                
+                // NEW: Check for satisfaction victory first, then score
+                if (game.p2.stats.satisfaction >= 100) {
+                    handleGameOver(null, 'p2_satisfaction', game);
+                } else if (game.p2.score >= 100) {
+                    handleGameOver(null, 'p2_win', game);
+                }
             }, 2000);
         }
         // FIXED: If result === 'p1', we send nothing. 
@@ -285,7 +291,11 @@ async function handlePlayerAction(ws, { gameId, action, userId }) {
     }
 
     game.p1.move = null; game.p2.move = null;
-    if (game[winnerKey].score >= 100) {
+    
+    // NEW: Check for satisfaction victory first, then score
+    if (game[winnerKey].stats.satisfaction >= 100) {
+        setTimeout(() => handleGameOver(null, winnerKey === 'p1' ? 'p1_satisfaction' : 'p2_satisfaction', game), 1500);
+    } else if (game[winnerKey].score >= 100) {
         setTimeout(() => handleGameOver(null, winnerKey === 'p1' ? 'p1_win' : 'p2_win', game), 1500);
     }
 }
@@ -327,10 +337,11 @@ async function handleGameOver(ws, reason, game) {
             loserId = (game.mode !== 'local' ? game.p2.userId : null);
             finalReason = 'p2_forfeit';
         }
-    } else if (reason === 'p1_win') {
+    // NEW: Include satisfaction reasons in the routing
+    } else if (reason === 'p1_win' || reason === 'p1_satisfaction') {
         winnerId = game.p1.userId;
         loserId = (game.mode !== 'local') ? game.p2.userId : null;
-    } else if (reason === 'p2_win') {
+    } else if (reason === 'p2_win' || reason === 'p2_satisfaction') {
         winnerId = (game.mode !== 'local') ? game.p2.userId : null;
         loserId = game.p1.userId;
     }
